@@ -1,0 +1,571 @@
+# FiestaRemasteredClient Deploy Pipeline
+# Author: Kyle Jensen
+
+parameters:
+  - name: buildPlatform
+    displayName: 'Build Platform'
+    type: string
+    default: standalonewindows64
+    values:
+    - ios 
+    - android
+    - webplayer
+    - webgl
+    - standaloneosxintel
+    - standaloneosxintel64
+    - standaloneosxuniversal
+    - standalonewindows
+    - standalonewindows64
+    - standalonelinux
+    - standalonelinux64
+    - standalonelinuxuniversal
+  - name: buildNumber
+    displayName: Build Number
+    type: number
+  - name: environment
+    displayName: Environment
+    type: string
+    default: dev
+    values: 
+    - dev
+    - stage
+    - prod
+  - name: releaseType
+    displayName: Release Type
+    type: string
+    default: patch
+    values:
+    - patch
+    - minor
+    - major
+
+variables:
+  PLATFORM_GAME_ID: 'some-game'
+
+pool:
+  vmImage: ubuntu-latest
+
+trigger:
+  branches:
+    include:
+    - main
+    exclude:
+    - main
+
+steps:
+
+# Cache apt packages
+- task: Cache@2
+  inputs:
+    key: 'bsdiff | "$(Agent.OS)" | apt-get'
+    restoreKeys: |
+      bsdiff | "$(Agent.OS)"
+    path: $(Pipeline.Workspace)/.apt-cache
+  displayName: 'Cache apt packages'
+
+
+# Setup git credentials
+- script: |
+    echo "Mapping Azure Pipelines Token for Git Authentication..."
+    git config --global credential.helper '!f() { echo "username=notrequired"; echo "password=$(System.AccessToken)"; }; f'
+  displayName: 'Setup git credentials'
+
+
+# Install bsdiff
+- script: |
+    mkdir -p $(Pipeline.Workspace)/.apt-cache
+    ln -s $(Pipeline.Workspace)/.apt-cache /var/cache/apt/archives
+    sudo apt-get update
+    sudo apt-get install -y bsdiff
+  displayName: 'Install bsdiff'
+
+
+# Install azure CLI & login
+- script: |
+    curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+    az login --service-principal \
+      --username $(AZ_SERVICE_PRINCIPAL_ID) \
+      --password $(AZ_SERVICE_PRINCIPAL_SECRET) \
+      --tenant $(AZ_TENANT_ID)
+
+    # echo "$AZ_PAT" | az devops login 2>/dev/null
+  displayName: 'Install azure CLI & login'
+  env:
+    AZ_TENANT_ID: $(AZ_TENANT_ID)
+    AZ_SERVICE_PRINCIPAL_ID: $(AZ_SERVICE_PRINCIPAL_ID)
+    AZ_SERVICE_PRINCIPAL_SECRET: $(AZ_SERVICE_PRINCIPAL_SECRET)
+    # AZ_PAT: $(AZ_PAT)
+
+
+
+# Delete expired builds
+- script: |
+    expiredBuildDate=$(date -u -d "-1 week" "+%Y-%m-%dT%H:%M:%S.000Z")
+
+    ucbDeleteBuildArtifactsUrl="https://build-api.cloud.unity3d.com/api/v1/orgs/$ucbOrgId/projects/$ucbProjectId/artifacts/delete?allWithExclusions=true"
+    ucbDeleteBuildArtifactsResponse=$(curl -s -w "\n%{http_code}" -X POST "$ucbDeleteBuildArtifactsUrl" \
+      -H "Authorization: Basic $ucbApiKey" \
+      -H "Content-Type: application/json" \
+      -d "{ \"deleteOnOrBeforeDate\": \"$expiredBuildDate\", \"excludedBuilds\": [], \"filters\": {} }" \
+      )
+
+    echo "Response: $ucbDeleteBuildArtifactsResponse"
+  
+    statusCode=$(echo "$ucbDeleteBuildArtifactsResponse" | tail -n1)
+    if [[ ! $statusCode -eq 200 ]]; then
+      echo "Failed to delete UCB artifacts."
+      exit 1
+    fi
+
+    jsonResponse=$(echo "$ucbDeleteBuildArtifactsResponse" | sed '$d')
+    numDeleted=$(echo "$jsonResponse" | jq -r '.numberOfDeletedBuildArtifacts')
+
+    echo "Successfully deleted $numDeleted UCB artifacts."
+
+  displayName: 'Delete all expired UCB build artifacts'
+
+
+# Retrieve build information from UCB share
+- script: |
+    ucbShareExpiry=$(date -u -d "+1 hour" "+%Y-%m-%dT%H:%M:%S.000Z")
+
+    echo "Creating share (expires $ucbShareExpiry)"
+
+    ucbCreateShareUrl="https://build-api.cloud.unity3d.com/api/v1/orgs/$ucbOrgId/projects/$ucbProjectId/buildtargets/${{parameters.buildPlatform}}/builds/${{parameters.buildNumber}}/share"
+    ucbCreateShareResponse=$(curl -X POST $ucbCreateShareUrl \
+      -H "Authorization: Basic $ucbApiKey" \
+      -H "Content-Type: application/json" \
+      -d "{ \"shareExpiry\": \"$ucbShareExpiry\" }")
+
+    echo "Create share response: $ucbCreateShareResponse"
+
+    if ! echo "$ucbCreateShareResponse" | jq -e '.shareid' > /dev/null; then
+      echo "The field '.shareid' does not exist in the JSON response."
+      exit 1
+    fi
+
+    ucbShareID=$(echo "$ucbCreateShareResponse" | jq -r '.shareid')
+
+    ucbGetShareDetailsUrl="https://build-api.cloud.unity3d.com/api/v1/shares/$ucbShareID"
+    ucbShareDetailsResponse=$(curl -X GET $ucbGetShareDetailsUrl \
+      -H "Authorization: Basic $ucbApiKey")
+
+    echo "Retrieved share details: $ucbShareDetailsResponse"
+
+    if ! echo "$ucbShareDetailsResponse" | jq -e '.links.download_primary.href' > /dev/null; then
+      echo "The field '.links.download_primary.href' does not exist in the JSON response."
+      exit 1
+    fi
+
+    ucbBuildUrl=$(echo "$ucbShareDetailsResponse" | jq -r '.links.download_primary.href') 
+    echo "Build URL = $ucbBuildUrl"
+
+    if ! echo "$ucbShareDetailsResponse" | jq -e '.lastBuiltRevision' > /dev/null; then
+      echo "The field '.lastBuiltRevision' does not exist in the JSON response."
+      exit 1
+    fi
+
+    buildCommit=$(echo "$ucbShareDetailsResponse" | jq -r '.lastBuiltRevision')
+    echo "Build Commit = $buildCommit"
+    
+    echo "##vso[task.setvariable variable=BUILD_URL]$ucbBuildUrl"
+    echo "##vso[task.setvariable variable=BUILD_COMMIT]$buildCommit"
+
+  displayName: 'Retrieve build information from UCB share'
+
+# Download and extract new build
+- script: |
+    downloadPath="$(pwd)/temp/download"
+    downloadFile="$downloadPath/build.zip"
+    extractPath="$(pwd)/temp/newbuild"
+
+    echo "download path=$downloadPath"
+    echo "extract path=$extractPath"
+
+    mkdir -p $downloadPath
+    mkdir -p $extractPath
+
+    wget -O "$downloadFile" --content-disposition "$(BUILD_URL)"
+
+    if [[ ! -f $downloadFile ]]; then
+      echo "Failed to download the build files."
+      exit 1
+    fi
+
+    unzip -o $downloadFile -d $extractPath
+    echo "Extraction completed successfully"
+
+    echo "Calculating file sizes..."
+    totalBuildSizeCompressed=$(ls -l "$downloadFile" | awk '{print $5}')
+    if [ $? -eq 0 ]; then
+      echo "File size calculation successful: $totalBuildSizeCompressed bytes (compressed)"
+    else
+      echo "Failed to calculate compressed file size"
+      exit 1
+    fi
+
+    totalBuildSizeUncompressed=$(du -sb "$extractPath" | awk '{print $1}')
+    if [ $? -eq 0 ]; then
+      echo "File size calculation successful: $totalBuildSizeUncompressed bytes (uncompressed)"
+    else
+      echo "Failed to calculate uncompressed folder size"
+      exit 1
+    fi
+
+    echo $(tree $extractPath)
+    echo "##vso[task.setvariable variable=NEW_BUILD_FOLDER]$extractPath"
+    echo "##vso[task.setvariable variable=INSTALL_SIZE_COMPRESSED]$totalBuildSizeCompressed"
+    echo "##vso[task.setvariable variable=INSTALL_SIZE_UNCOMPRESSED]$totalBuildSizeUncompressed"
+
+  displayName: 'Download and extract new build'
+
+
+  # Download and extract previous build
+- script: |
+    echo "$(NEW_BUILD_FOLDER)"
+
+    # Get the latest version tag of this deployment
+    selectVersionQuery="SELECT TOP 1 (ClientVersion) FROM dbo.ClientVersions \
+      WHERE dbo.ClientVersions.PlatformGameID = '$(PLATFORM_GAME_ID)' \
+      ORDER BY ClientVersion DESC;"
+
+    result=$(sqlcmd \
+      -S "$PLATFORM_DATABASE_HOST" \
+      -d "$PLATFORM_DATABASE_NAME" \
+      -U "$PLATFORM_DATABASE_USER" \
+      -P "$PLATFORM_DATABASE_PASS" \
+      -Q "$selectVersionQuery" \
+      -h -1)
+
+    latestVersion=$(echo "$result" | head -n 1 | tr -d '[:space:]')
+
+    echo "Latest build version: $latestVersion"
+    if [[ -z $latestVersion ]]; then
+      echo "No versions found. Skipping."
+      exit 0
+    fi
+
+    downloadPath="$(pwd)/temp/download"
+    extractPath="$(pwd)/temp/previousbuild"
+
+    echo "download path=$downloadPath"
+    echo "extract path=$extractPath"
+    echo "pwd=$(pwd)"
+
+    mkdir -p $extractPath
+
+    # Reconstruct the previous build file name based on the version data
+    previousInstallFileName=$(echo "$(PLATFORM_GAME_ID)-${{parameters.buildPlatform}}-$latestVersion-install.zip" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+
+    # Download from blob storage using reconstructed name 
+    wget "$(AZ_BLOB_INSTALL_URL)/$previousInstallFileName" -P "$downloadPath"
+
+    if [ $? -ne 0 ]; then
+      echo "##vso[task.logissue type=warning;]Base installation not found. Skipping patch creation."
+      skipPatchCreation=true
+    else
+      echo "Base installation found. Proceeding with patch creation."
+      skipPatchCreation=false
+
+      echo $(tree $downloadPath)
+
+      downloadFile="$downloadPath/$previousInstallFileName"
+      unzip -o $downloadFile -d $extractPath
+
+      echo $(tree $extractPath)
+
+      echo "##vso[task.setvariable variable=PREVIOUS_BUILD_FOLDER]$extractPath"
+    fi
+
+    echo "##vso[task.setvariable variable=SKIP_PATCH_CREATION]$skipPatchCreation"
+    echo "##vso[task.setvariable variable=LATEST_VERSION_TAG]$latestVersion"
+
+
+  env:
+    PLATFORM_DATABASE_HOST: $(PLATFORM_DATABASE_HOST)
+    PLATFORM_DATABASE_NAME: $(PLATFORM_DATABASE_NAME)
+    PLATFORM_DATABASE_USER: $(PLATFORM_DATABASE_USER)
+    PLATFORM_DATABASE_PASS: $(PLATFORM_DATABASE_PASS)
+
+  displayName: 'Download and extract previous build'
+  
+
+# Generate new version tag
+- script: |
+    git fetch --tags
+
+    versionTag="$(LATEST_VERSION_TAG)"
+    if [[ -z $versionTag ]]; then
+      versionTag="0.0.0"
+    fi
+
+    echo "latest version = $versionTag"
+
+    prevTaggedCommit=$(git rev-list -n 1 $versionTag)
+
+    echo "prev $prevTaggedCommit"
+    echo "curr $(BUILD_COMMIT)"
+    
+    if [[ $prevTaggedCommit != $(BUILD_COMMIT) ]]; then
+      major=$(echo $versionTag | cut -d '.' -f 1)
+      minor=$(echo $versionTag | cut -d '.' -f 2)
+      patch=$(echo $versionTag | cut -d '.' -f 3)
+
+      case ${{ parameters.releaseType }} in
+        major)
+          newTag="$((major + 1)).0.0"
+          ;;
+        minor)
+          newTag="$major.$((minor + 1)).0"
+          ;;
+        patch)
+          newTag="$major.$minor.$((patch + 1))"
+          ;;
+        *)
+          echo "unknown release type"
+          exit 1
+          ;;
+      esac
+
+      versionTag=$newTag
+    fi
+
+    echo "updated version = $versionTag"
+    echo "##vso[task.setvariable variable=UPDATED_VERSION_TAG]$versionTag"  
+
+  displayName: 'Generate new version tag'
+
+
+# Generate artifact details
+- script: |
+    organization=$(echo $(System.TeamFoundationCollectionUri) | sed 's:/*$::' | awk -F'/' '{print $NF}')
+    echo "##vso[task.setvariable variable=AZ_ORGANIZATION]$organization"
+
+    project=$(echo $(PLATFORM_GAME_ID) | sed -e 's/ /%20/g')
+    echo "##vso[task.setvariable variable=AZ_PROJECT]$project"
+
+    installArtifactName=$(echo "$(PLATFORM_GAME_ID)-${{parameters.buildPlatform}}-$(UPDATED_VERSION_TAG)-install" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+    echo "##vso[task.setvariable variable=AZ_INSTALL_ARTIFACT_NAME]$installArtifactName"
+
+    patchArtifactName=$(echo "$(PLATFORM_GAME_ID)-${{parameters.buildPlatform}}-$(UPDATED_VERSION_TAG)-patch" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+    echo "##vso[task.setvariable variable=AZ_PATCH_ARTIFACT_NAME]$patchArtifactName"
+
+  displayName: 'Generate artifact details'
+
+
+# Create and upload patch artifact
+- script: |
+    echo "$(PREVIOUS_BUILD_FOLDER)"
+
+    newBuildPath=$(NEW_BUILD_FOLDER)
+    previousBuildPath=$(PREVIOUS_BUILD_FOLDER)
+    
+    patchPath="$(pwd)/temp/patch"
+    mkdir -p "$patchPath"
+
+    echo "New build tree: $(tree $newBuildPath)"
+    echo "Previous build tree: $(tree $previousBuildPath)"
+
+    while IFS= read -r -d '' newFile; do
+      relativePath="${newFile#$newBuildPath/}"
+      echo "relative path=$relativePath"
+
+      previousFile="$previousBuildPath/$relativePath"
+      echo "previous file=$previousFile"
+
+      patchRelPath="$patchPath/$relativePath"
+      echo "patch relative path=$patchRelPath"
+      mkdir -p "$(dirname "$patchRelPath")"
+
+      if [[ -f $previousFile ]]; then
+        echo "creating patch file $patchRelPath.patch"
+        bsdiff "$newFile" "$previousFile" "$patchRelPath.patch"
+      else
+        echo "file not found. copying $newFile to $patchRelPath"
+        cp "$newFile" "$patchRelPath"
+      fi
+    done < <(find "$newBuildPath" -type f -print0)
+
+    patchArtifactName=$(AZ_PATCH_ARTIFACT_NAME)
+    patchArtifactPath="$(pwd)/temp/artifacts/$patchArtifactName"
+
+    mkdir -p $patchArtifactPath
+
+    patchArtifactFilePath="$patchArtifactPath/$patchArtifactName.zip"
+    (cd $patchPath && zip -r "$patchArtifactFilePath" .)
+
+    echo "$(tree $patchPath)"
+
+    az storage blob upload \
+      --account-name gbplatformstorage \
+      --container-name "patches" \
+      --file "$patchArtifactFilePath" \
+      --name "$patchArtifactName.zip" \
+      --auth-mode login \
+      --overwrite
+
+    if [ $? -ne 0 ]; then
+      echo "New patch artifact failed to publish."
+      exit 1
+    fi
+
+    echo "Deployed new patch $patchArtifactName version $(UPDATED_VERSION_TAG) to blob storage."
+  
+    echo "Calculating file sizes..."
+    totalPatchSizeCompressed=$(ls -l "$patchArtifactFilePath" | awk '{print $5}')
+    if [ $? -eq 0 ]; then
+      echo "File size calculation successful: $totalPatchSizeCompressed bytes (compressed)"
+    else
+      echo "Failed to calculate compressed file size"
+      exit 1
+    fi
+
+    totalPatchSizeUncompressed=$(du -sb "$patchPath" | awk '{print $1}')
+    if [ $? -eq 0 ]; then
+      echo "File size calculation successful: $totalPatchSizeUncompressed bytes (uncompressed)"
+    else
+      echo "Failed to calculate uncompressed folder size"
+      exit 1
+    fi
+  
+    echo "##vso[task.setvariable variable=PATCH_SIZE_COMPRESSED]$totalPatchSizeCompressed"
+    echo "##vso[task.setvariable variable=PATCH_SIZE_UNCOMPRESSED]$totalPatchSizeUncompressed"
+
+  condition: and(succeeded(), ne(variables['SKIP_PATCH_CREATION'], 'true'))
+  displayName: 'Create and upload patch artifact'
+  
+
+# Create and replace installation artifact
+- script: |
+    installArtifactName=$(AZ_INSTALL_ARTIFACT_NAME)
+    installArtifactPath="$(pwd)/temp/artifacts/$installArtifactName"
+
+    mkdir -p $installArtifactPath
+
+    echo $(NEW_BUILD_FOLDER)
+    echo "$(tree $(NEW_BUILD_FOLDER))"
+
+    installArtifactFilePath="$installArtifactPath/$installArtifactName.zip"
+    (cd $(NEW_BUILD_FOLDER) && zip -r "$installArtifactFilePath" .) 
+
+    echo "install path $installArtifactPath"
+    
+    az storage blob upload \
+      --account-name gbplatformstorage \
+      --container-name "installations" \
+      --file "$installArtifactFilePath" \
+      --name "$installArtifactName.zip" \
+      --auth-mode login \
+      --overwrite
+
+    if [ $? -ne 0 ]; then
+      echo "Base installation artifact failed to publish."
+      exit 1
+    fi
+
+    echo "Deployed new installation $installArtifactName version $(UPDATED_VERSION_TAG) to blob storage."
+
+  displayName: 'Create and replace installation artifact'
+
+
+# Publish version tags
+- script: |
+      echo "Updating tag from $LATEST_VERSION_TAG to $UPDATED_VERSION_TAG"
+      
+      git fetch origin +$(BUILD_COMMIT):refs/remotes/origin/tmp
+
+      if git rev-parse "$UPDATED_VERSION_TAG" >/dev/null 2>&1; then
+        git tag -d "$UPDATED_VERSION_TAG"
+        git push origin :refs/tags/"$UPDATED_VERSION_TAG"
+      fi
+
+      git tag "$UPDATED_VERSION_TAG" "$(BUILD_COMMIT)"
+
+      if [ $? -ne 0 ]; then
+        echo "Error: Failed to create tag $UPDATED_VERSION_TAG"
+        exit 1
+      fi
+
+      git push origin --tags
+
+      if [ $? -ne 0 ]; then
+        echo "Error: Failed to push tag $UPDATED_VERSION_TAG"
+        exit 1
+      fi
+
+      echo "Successfully updated tag from $LATEST_VERSION_TAG to $UPDATED_VERSION_TAG"
+
+  displayName: 'Publish version tags'
+
+
+# Update client version table
+- script: |
+    echo "Update client version table"
+    
+    # Get hash of the entire client codebase
+    buildHash=$(find "$NEW_BUILD_FOLDER" \
+      -type f -print0 \
+      | sort -z \
+      | xargs -0 sha256sum \
+      | sha256sum \
+      | awk '{print $1}' \
+    )
+
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to generate build hash"
+      exit 1
+    fi
+
+    echo "Generated build hash: $buildHash"
+
+    # Get the latest version tag of this deployment
+    insertClientVersionQuery="\
+      INSERT INTO [dbo].[ClientVersions] \
+        ([ClientVersion] \
+        ,[ClientPlatform] \
+        ,[ClientBuildHash] \
+        ,[ClientBuildNumber] \
+        ,[PlatformGameID] \
+        ,[InstallSize] \
+        ,[InstallSizeCompressed] \
+        ,[PatchSize] \
+        ,[PatchSizeCompressed]) \
+      VALUES \
+        ('$UPDATED_VERSION_TAG' \
+        ,'${{parameters.buildPlatform}}' \
+        ,'$buildHash' \
+        ,'${{parameters.buildNumber}}' \
+        ,'$(PLATFORM_GAME_ID)' \
+        ,'$(INSTALL_SIZE_UNCOMPRESSED)' \
+        ,'$(INSTALL_SIZE_COMPRESSED)' \
+        ,'$(PATCH_SIZE_UNCOMPRESSED)' \
+        ,'$(PATCH_SIZE_COMPRESSED)')"
+
+    echo "Inserting client version details into database"
+
+    sqlcmd \
+      -S "$PLATFORM_DATABASE_HOST" \
+      -d "$PLATFORM_DATABASE_NAME" \
+      -U "$PLATFORM_DATABASE_USER" \
+      -P "$PLATFORM_DATABASE_PASS" \
+      -Q "$insertClientVersionQuery"
+
+    if [ $? -ne 0 ]; then
+      echo "Base installation artifact failed to publish."
+      exit 1
+    fi
+  
+  env:
+    PLATFORM_DATABASE_HOST: $(PLATFORM_DATABASE_HOST)
+    PLATFORM_DATABASE_NAME: $(PLATFORM_DATABASE_NAME)
+    PLATFORM_DATABASE_USER: $(PLATFORM_DATABASE_USER)
+    PLATFORM_DATABASE_PASS: $(PLATFORM_DATABASE_PASS)
+
+  displayName: 'Update client version table'
+
+
+- script: |
+    az logout
+  displayName: 'Cleanup'
+  condition: always()
