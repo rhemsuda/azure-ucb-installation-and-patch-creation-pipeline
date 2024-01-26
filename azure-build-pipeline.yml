@@ -1,0 +1,96 @@
+# FiestaRemasteredClient Build Pipeline
+# Author: Kyle Jensen
+
+parameters:
+  - name: buildTarget
+    displayName: Build Target
+    type: string
+    default: standalonewindows64
+    values:
+    - ios 
+    - android
+    - webplayer
+    - webgl
+    - standaloneosxintel
+    - standaloneosxintel64
+    - standaloneosxuniversal
+    - standalonewindows
+    - standalonewindows64
+    - standalonelinux
+    - standalonelinux64
+    - standalonelinuxuniversal
+  - name: releaseType
+    displayName: 'Release Type'
+    type: string
+    default: 'patch'
+    values:
+    - major
+    - minor
+    - patch
+
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: |
+    if [[ "${{ parameters.releaseType }}" == "major" && "$(Build.SourceBranchName)" != "main" ]]; then
+      echo "Major release types are only allowed from the main branch."
+      exit 1
+    fi
+  displayName: 'Validate user-defined parameters'
+
+- script: |
+    echo "Mapping Azure Pipelines Token for Git Authentication..."
+    git config --global credential.helper '!f() { echo "username=notrequired"; echo "password=$(System.AccessToken)"; }; f'
+  displayName: 'Setup git credentials'
+
+- script: |
+    echo "Create build on Unity Cloud"
+
+    currentCommit=$(git rev-parse HEAD)
+
+    # Cancel all running builds - we can only handle one at a time due to subscription limits
+    cancelUnityCloudBuildsUrl="https://build-api.cloud.unity3d.com/api/v1/orgs/$UCB_ORG_ID/projects/$UCB_PROJECT_ID/buildtargets/${{parameters.buildTarget}}/builds"
+    cancelUnityCloudBuildsResponse=$(curl -s -w "\n%{http_code}" -X DELETE $cancelUnityCloudBuildsUrl \
+      -H "Authorization: Basic $UCB_APIKEY" \
+    )
+
+    statusCode=$(echo "$cancelUnityCloudBuildsResponse" | tail -n1)
+    echo "StatusCode: $statusCode"
+    
+    if [[ ! $statusCode -eq 204 ]]; then
+      echo "Failed to delete running UCB builds."
+      exit 1 
+    fi
+
+    # Create new build using the unity cloud platform
+    createUnityCloudBuildUrl="https://build-api.cloud.unity3d.com/api/v1/orgs/$UCB_ORG_ID/projects/$UCB_PROJECT_ID/buildtargets/${{parameters.buildTarget}}/builds"
+    createUnityCloudBuildResponse=$(curl -s -w "\n%{http_code}" -X POST $createUnityCloudBuildUrl \
+      -H "Authorization: Basic $UCB_APIKEY" \
+      -H "Content-Type: application/json" \
+      -d "{ \"delay\": 100, \"commit\": \"$currentCommit\", \"label\": \"type=${{ parameters.releaseType }}\"}"
+    )
+
+    jsonResponse=$(echo "$createUnityCloudBuildResponse" | sed '$d')
+    statusCode=$(echo "$createUnityCloudBuildResponse" | tail -n1)
+    echo "StatusCode: $statusCode"
+    
+    if [[ ! $statusCode -eq 202 ]]; then
+      echo "Failed to start UCB build."
+      exit 1 
+    fi
+
+    buildNumber=$(echo $jsonResponse | jq -r '.[0].build')
+    buildGUID=$(echo $jsonResponse | jq -r '.[0].buildGUID')
+    
+    echo "Successfully started UCB build."
+    echo "Build Number: $buildNumber"
+    echo "Build GUID: $buildGUID"
+
+  displayName: 'Deploy new version'
+  env:
+    UCB_ORG_ID: $(UCB_ORG_ID)
+    UCB_PROJECT_ID: $(UCB_PROJECT_ID)
+    UCB_APIKEY: $(UCB_APIKEY)
