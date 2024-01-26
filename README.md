@@ -13,4 +13,5 @@ How it works:
 
 The launcher can then call a series of API endpoints to interact with the database, get the most recent version & it's installation/patch links. If the game isn't installed, it can use the install URL, and if the game is installed but is out of date, it can download all the patches and run bspatch to update the client.
 
-This is demonstrated in the PlatformLauncher repository
+This is demonstrated in the PlatformLauncher repository. 
+These files come from a private repository, and thus their histories do not belong to this repo.
